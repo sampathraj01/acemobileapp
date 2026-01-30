@@ -1,0 +1,334 @@
+import React, { useState, useRef } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  FlatList,
+  Image,
+  StyleSheet,
+  Platform,
+  PermissionsAndroid,
+  Alert,
+} from 'react-native';
+
+import DocumentPicker from 'react-native-document-picker';
+import { useChatStore } from '../store/useChatStore';
+import { PresignService } from '../services/aws/PresignService';
+import { CognitoAuthService } from '../services/aws/CognitoAuthService';
+import { AWS_CONFIG } from '../config/config';
+import { Attachment } from '../models/Message';
+
+const MAX_FILES = 5;
+const MAX_FILE_SIZE = 5 * 1024 * 1024;
+
+export const Composer = () => {
+  const [text, setText] = useState('');
+  const [files, setFiles] = useState<any[]>([]);
+  const [isSending, setIsSending] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0 });
+  const [error, setError] = useState<string | null>(null);
+
+  const inputRef = useRef<TextInput>(null);
+  const { sendMessage, currentGroupId } = useChatStore();
+
+  const presignService = new PresignService(
+    AWS_CONFIG.presignApi.url,
+    new CognitoAuthService()
+  );
+
+  // Android permission
+  const requestStoragePermission = async () => {
+    if (Platform.OS !== 'android') return true;
+
+    try {
+      // Android 13+
+      if (Platform.Version >= 33) {
+        const imagePermission = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES
+        );
+
+        const videoPermission = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO
+        );
+
+        const audioPermission = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO
+        );
+
+        return (
+          imagePermission === PermissionsAndroid.RESULTS.GRANTED ||
+          videoPermission === PermissionsAndroid.RESULTS.GRANTED ||
+          audioPermission === PermissionsAndroid.RESULTS.GRANTED
+        );
+      }
+
+      // Android 12 and below
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE
+      );
+
+      return granted === PermissionsAndroid.RESULTS.GRANTED;
+    } catch (err) {
+      console.warn('Permission error:', err);
+      return false;
+    }
+  };
+
+
+  // Pick files
+  const pickFiles = async () => {
+    const hasPermission = await requestStoragePermission();
+    if (!hasPermission) return Alert.alert('Permission denied');
+
+    try {
+      const picked = await DocumentPicker.pickMultiple({
+        allowMultiSelection: true,
+        type: [
+          DocumentPicker.types.images,
+          DocumentPicker.types.pdf,
+          DocumentPicker.types.doc,
+          DocumentPicker.types.docx,
+        ],
+      });
+
+
+      if (files.length + picked.length > MAX_FILES) {
+        setError(`Max ${MAX_FILES} files allowed`);
+        return;
+      }
+
+      const valid = picked.filter(f => f.size <= MAX_FILE_SIZE);
+      setFiles(prev => [...prev, ...valid]);
+
+    } catch (err) {
+      if (!DocumentPicker.isCancel(err)) {
+        console.error(err);
+      }
+    }
+  };
+
+  // Remove file
+  const removeFile = (index: number) => {
+    setFiles(prev => prev.filter((_, i) => i !== index));
+  };
+
+  // Upload file to S3
+  const uploadFile = async (file: any): Promise<Attachment> => {
+    const contentType = file.type || 'application/octet-stream';
+
+    const { uploadUrl, key, bucket } = await presignService.presignUpload({
+      contentType,
+      originalFileName: file.name,
+    });
+
+    const response = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': contentType },
+      body: {
+        uri: file.uri,
+        type: contentType,
+        name: file.name,
+      } as any,
+    });
+
+    if (!response.ok) throw new Error('Upload failed');
+
+    return {
+      bucket,
+      key,
+      contentType,
+      originalFileName: file.name,
+      sizeBytes: file.size,
+      uploadedAt: new Date().toISOString(),
+    };
+  };
+
+  // Send message
+  const handleSend = async () => {
+    if ((!text.trim() && files.length === 0) || !currentGroupId) return;
+
+    setIsSending(true);
+    setError(null);
+    setUploadProgress({ current: 0, total: files.length });
+
+    try {
+      let attachments: Attachment[] = [];
+
+      if (files.length > 0) {
+        for (let i = 0; i < files.length; i++) {
+          const uploaded = await uploadFile(files[i]);
+          attachments.push(uploaded);
+          setUploadProgress(prev => ({ ...prev, current: i + 1 }));
+        }
+      }
+
+      await sendMessage(text || null, attachments);
+
+      setText('');
+      setFiles([]);
+      inputRef.current?.focus();
+
+    } catch (err: any) {
+      setError(err.message || 'Send failed');
+    } finally {
+      setIsSending(false);
+      setUploadProgress({ current: 0, total: 0 });
+    }
+  };
+
+  if (!currentGroupId) {
+    return (
+      <View style={styles.disabled}>
+        <Text>Select a group to start chatting</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      {error && <Text style={styles.error}>{error}</Text>}
+
+      {/* File Preview */}
+      {files.length > 0 && (
+        <FlatList
+          horizontal
+          data={files}
+          keyExtractor={(item, index) => index.toString()}
+          contentContainerStyle={{ paddingVertical: 8 }}
+          renderItem={({ item, index }) => {
+            const isImage = item.type?.startsWith('image/');
+
+            return (
+              <View style={styles.previewBox}>
+                {isImage ? (
+                  <Image source={{ uri: item.uri }} style={styles.previewImage} />
+                ) : (
+                  <View style={styles.fileIcon}>
+                    <Text>📎</Text>
+                    <Text numberOfLines={1} style={styles.fileName}>{item.name}</Text>
+                  </View>
+                )}
+
+                <TouchableOpacity onPress={() => removeFile(index)} style={styles.removeBtn}>
+                  <Text style={{ color: '#fff' }}>×</Text>
+                </TouchableOpacity>
+              </View>
+            );
+          }}
+        />
+      )}
+
+      {/* Upload progress */}
+      {uploadProgress.total > 0 && (
+        <Text style={styles.progress}>
+          Uploading {uploadProgress.current}/{uploadProgress.total}
+        </Text>
+      )}
+
+      {/* Input row */}
+      <View style={styles.row}>
+        <TouchableOpacity onPress={pickFiles} disabled={isSending}>
+          <Text style={styles.attachBtn}>📎</Text>
+        </TouchableOpacity>
+
+        <TextInput
+          ref={inputRef}
+          value={text}
+          onChangeText={setText}
+          placeholder={files.length ? 'Add a caption...' : 'Type a message...'}
+          multiline
+          style={styles.input}
+        />
+
+        <TouchableOpacity onPress={handleSend} disabled={isSending}>
+          <Text style={styles.sendBtn}>
+            {isSending ? 'Sending...' : 'Send'}
+          </Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: {
+    borderTopWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#fff',
+    padding: 8,
+  },
+  disabled: {
+    height: 70,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#f9fafb',
+  },
+  error: {
+    color: 'red',
+    marginBottom: 6,
+  },
+  row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  attachBtn: {
+    fontSize: 22,
+    paddingHorizontal: 8,
+  },
+  input: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    maxHeight: 120,
+  },
+  sendBtn: {
+    backgroundColor: '#2563eb',
+    color: '#fff',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  previewBox: {
+    width: 80,
+    height: 80,
+    marginRight: 8,
+    borderRadius: 8,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#ddd',
+  },
+  previewImage: {
+    width: '100%',
+    height: '100%',
+  },
+  fileIcon: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  fileName: {
+    fontSize: 10,
+    marginTop: 4,
+  },
+  removeBtn: {
+    position: 'absolute',
+    top: 2,
+    right: 2,
+    backgroundColor: 'red',
+    borderRadius: 12,
+    width: 20,
+    height: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  progress: {
+    fontSize: 12,
+    color: '#2563eb',
+    marginBottom: 4,
+  },
+});
